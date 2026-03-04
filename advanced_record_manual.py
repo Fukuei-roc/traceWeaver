@@ -18,18 +18,18 @@ Commands:
     quit    - Save everything and exit
 """
 
-import asyncio
 import json
 import os
 import sys
 import platform
 import uuid
+import threading
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
 
-from playwright.async_api import (
-    async_playwright,
+from playwright.sync_api import (
+    sync_playwright,
     Browser,
     BrowserContext,
     Page,
@@ -41,8 +41,9 @@ from playwright.async_api import (
 # Configuration
 # ============================================================================
 
-# High-value resource types to record
-RECORD_RESOURCE_TYPES = ("xhr", "fetch")
+# All resource types to record (empty = all types)
+# Options: "xhr", "fetch", "document", "stylesheet", "image", "script", "font", "websocket", "other"
+RECORD_RESOURCE_TYPES = ()  # Empty tuple = record all types
 
 # Maximum response body size to capture inline (bytes)
 MAX_INLINE_BODY_SIZE = 512 * 1024  # 512KB
@@ -68,6 +69,9 @@ class ArtifactCollector:
         
         # Markers for timeline
         self.markers: list = []
+        
+        # Thread lock for file writing
+        self._lock = threading.Lock()
         
     def setup(self) -> None:
         """Create directory structure and open file handles."""
@@ -98,7 +102,10 @@ class ArtifactCollector:
             self.requestfailed_log_file,
         ]:
             if f:
-                f.close()
+                try:
+                    f.close()
+                except Exception:
+                    pass
                 
     def get_run_dir(self) -> Path:
         """Return the run directory path."""
@@ -108,7 +115,7 @@ class ArtifactCollector:
     # Network Logging
     # ------------------------------------------------------------------------
     
-    async def log_network(self, request: Request, response: Optional[Response]) -> None:
+    def log_network(self, request: Request, response: Optional[Response]) -> None:
         """Log a network request/response pair."""
         if not self.network_log_file:
             return
@@ -140,7 +147,7 @@ class ArtifactCollector:
                 
                 # Try to capture response body
                 try:
-                    body = await response.body()
+                    body = response.body()
                     if body and len(body) <= MAX_INLINE_BODY_SIZE:
                         # Try to decode as text/json
                         try:
@@ -164,9 +171,10 @@ class ArtifactCollector:
             else:
                 req_data["response"] = None
                 
-            # Write to JSONL
-            self.network_log_file.write(json.dumps(req_data, ensure_ascii=False) + "\n")
-            self.network_log_file.flush()
+            # Write to JSONL (thread-safe)
+            with self._lock:
+                self.network_log_file.write(json.dumps(req_data, ensure_ascii=False) + "\n")
+                self.network_log_file.flush()
             
         except Exception as e:
             print(f"[ERROR] Failed to log network: {e}", file=sys.stderr)
@@ -187,8 +195,9 @@ class ArtifactCollector:
                 "text": msg.text,
                 "location": f"{msg.location.get('url', '')}:{msg.location.get('lineNumber', 0)}",
             }
-            self.console_log_file.write(json.dumps(entry, ensure_ascii=False) + "\n")
-            self.console_log_file.flush()
+            with self._lock:
+                self.console_log_file.write(json.dumps(entry, ensure_ascii=False) + "\n")
+                self.console_log_file.flush()
         except Exception as e:
             print(f"[ERROR] Failed to log console: {e}", file=sys.stderr)
             
@@ -207,8 +216,9 @@ class ArtifactCollector:
                 "error": str(error),
                 "type": type(error).__name__,
             }
-            self.pageerror_log_file.write(json.dumps(entry, ensure_ascii=False) + "\n")
-            self.pageerror_log_file.flush()
+            with self._lock:
+                self.pageerror_log_file.write(json.dumps(entry, ensure_ascii=False) + "\n")
+                self.pageerror_log_file.flush()
         except Exception as e:
             print(f"[ERROR] Failed to log pageerror: {e}", file=sys.stderr)
             
@@ -230,8 +240,9 @@ class ArtifactCollector:
                 "resource_type": request.resource_type,
                 "failure": failure.error_text if failure else "Unknown",
             }
-            self.requestfailed_log_file.write(json.dumps(entry, ensure_ascii=False) + "\n")
-            self.requestfailed_log_file.flush()
+            with self._lock:
+                self.requestfailed_log_file.write(json.dumps(entry, ensure_ascii=False) + "\n")
+                self.requestfailed_log_file.flush()
         except Exception as e:
             print(f"[ERROR] Failed to log requestfailed: {e}", file=sys.stderr)
             
@@ -252,11 +263,11 @@ class ArtifactCollector:
     # Screenshots
     # ------------------------------------------------------------------------
     
-    async def screenshot(self, name: str, page: Page) -> None:
+    def screenshot(self, name: str, page: Page) -> None:
         """Capture screenshot."""
         try:
             path = self.screenshots_dir / f"{name}.png"
-            await page.screenshot(path=path, full_page=False)
+            page.screenshot(path=path, full_page=False)
             print(f"[SCREENSHOT] Saved: {path}")
         except Exception as e:
             print(f"[ERROR] Failed to capture screenshot: {e}", file=sys.stderr)
@@ -265,10 +276,10 @@ class ArtifactCollector:
     # DOM Snapshot
     # ------------------------------------------------------------------------
     
-    async def save_dom(self, page: Page) -> None:
+    def save_dom(self, page: Page) -> None:
         """Save full page HTML."""
         try:
-            html = await page.content()
+            html = page.content()
             path = self.dom_dir / "page.html"
             path.write_text(html, encoding="utf-8")
             print(f"[DOM] Saved: {path}")
@@ -279,11 +290,11 @@ class ArtifactCollector:
     # Storage State
     # ------------------------------------------------------------------------
     
-    async def save_storage_state(self, context: BrowserContext) -> None:
+    def save_storage_state(self, context: BrowserContext) -> Optional[Path]:
         """Save browser storage state."""
         try:
             path = self.run_dir / "storage_state.json"
-            await context.storage_state(path=path)
+            context.storage_state(path=path)
             print(f"[STORAGE] Saved: {path}")
             return path
         except Exception as e:
@@ -294,7 +305,7 @@ class ArtifactCollector:
     # Metadata
     # ------------------------------------------------------------------------
     
-    async def save_metadata(
+    def save_metadata(
         self,
         browser: Browser,
         playwright_version: str,
@@ -305,9 +316,6 @@ class ArtifactCollector:
             # Get browser version
             browser_version = browser.version
             
-            # Get user agent
-            user_agent = ""
-            
             meta = {
                 "timestamp": datetime.now(timezone.utc).isoformat(),
                 "run_id": self.run_dir.name,
@@ -317,11 +325,10 @@ class ArtifactCollector:
                 "playwright_version": playwright_version,
                 "browser": browser.browser_type.name,
                 "browser_version": browser_version,
-                "user_agent": user_agent,
                 "viewport": viewport,
                 "headless": False,  # Always visible for manual control
                 "timezone": str(datetime.now(timezone.utc).astimezone().tzinfo),
-                "locale": "en-US",  # Default, can be customized
+                "locale": "en-US",
                 "markers": self.markers,
             }
             
@@ -357,7 +364,7 @@ class NetworkRecorder:
         self.trace_path: Optional[Path] = None
         self.har_path: Optional[Path] = None
         
-    async def start(self) -> None:
+    def start(self) -> None:
         """Initialize Playwright and launch browser."""
         print("[INIT] Starting Playwright Network Recorder...")
         
@@ -366,9 +373,9 @@ class NetworkRecorder:
         self.collector.setup()
         
         # Launch Playwright
-        self.playwright = await async_playwright().start()
+        self.playwright = sync_playwright().start()
         
-        # Get Playwright version - use importlib.metadata for async_playwright
+        # Get Playwright version
         try:
             from importlib.metadata import version
             pw_version = version("playwright")
@@ -380,28 +387,28 @@ class NetworkRecorder:
         self.trace_path = self.collector.get_run_dir() / "trace.zip"
         self.har_path = self.collector.get_run_dir() / "trace.har"
         
-        # Launch browser with HAR recording
-        self.browser = await self.playwright.chromium.launch(
+        # Launch browser
+        self.browser = self.playwright.chromium.launch(
             headless=False,  # Visible browser for manual control
             args=["--disable-popup-blocking"],
         )
         
         # Get viewport from default context
-        default_context = await self.browser.new_context()
-        default_page = await default_context.new_page()
+        default_context = self.browser.new_context()
+        default_page = default_context.new_page()
         viewport = default_page.viewport_size or {"width": 1280, "height": 720}
-        await default_page.close()
-        await default_context.close()
+        default_page.close()
+        default_context.close()
         
         # Create context with HAR recording
-        self.context = await self.browser.new_context(
+        self.context = self.browser.new_context(
             viewport=viewport,
             record_har_path=str(self.har_path),
-            record_har_content="attach",  # Attach to response
+            record_har_content="attach",
         )
         
         # Create page
-        self.page = await self.context.new_page()
+        self.page = self.context.new_page()
         
         # Setup event handlers
         self._setup_event_handlers()
@@ -409,10 +416,10 @@ class NetworkRecorder:
         # Note: Tracing will start when 'start' command is issued
         
         # Save initial metadata
-        await self.collector.save_metadata(self.browser, pw_version, viewport)
+        self.collector.save_metadata(self.browser, pw_version, viewport)
         
         # Take initial screenshot
-        await self.collector.screenshot("initial", self.page)
+        self.collector.screenshot("initial", self.page)
         
         print(f"[INIT] Browser launched. Run directory: {self.collector.get_run_dir()}")
         print("[READY] Use 'start' to begin recording, 'stop' to stop.")
@@ -444,21 +451,21 @@ class NetworkRecorder:
             self.collector.log_pageerror(error)
             # Take error screenshot if recording
             if self.is_recording and self.page:
-                asyncio.create_task(self.collector.screenshot("error", self.page))
+                self.collector.screenshot("error", self.page)
                 
     def _handle_requestfailed(self, request: Request) -> None:
         """Handle failed request."""
         if self.collector:
             self.collector.log_requestfailed(request)
             
-    async def _handle_response(self, response: Response) -> None:
-        """Handle network response - record if high-value and recording."""
+    def _handle_response(self, response: Response) -> None:
+        """Handle network response - record if recording."""
         if not self.is_recording:
             return
             
-        # Check if this is a high-value resource type
+        # Check if this is a high-value resource type (if configured)
         resource_type = response.request.resource_type
-        if resource_type not in RECORD_RESOURCE_TYPES:
+        if RECORD_RESOURCE_TYPES and resource_type not in RECORD_RESOURCE_TYPES:
             return
             
         # Get the request object
@@ -466,13 +473,13 @@ class NetworkRecorder:
         
         # Log the network interaction
         if self.collector:
-            await self.collector.log_network(request, response)
+            self.collector.log_network(request, response)
             
     # ------------------------------------------------------------------------
     # Recording Control
     # ------------------------------------------------------------------------
     
-    async def start_recording(self) -> None:
+    def start_recording(self) -> None:
         """Enable recording mode."""
         if self.is_recording:
             print("[WARN] Already recording!")
@@ -480,13 +487,13 @@ class NetworkRecorder:
             
         self.is_recording = True
         
-        # Start tracing with full capture - stop first if already started
+        # Start tracing with full capture
         try:
-            await self.context.tracing.stop()
+            self.context.tracing.stop()
         except Exception:
             pass  # Tracing not started yet, ignore
         
-        await self.context.tracing.start(
+        self.context.tracing.start(
             screenshots=True,
             snapshots=True,
             sources=True,
@@ -494,11 +501,11 @@ class NetworkRecorder:
         
         # Screenshot on start
         if self.page and self.collector:
-            await self.collector.screenshot("start", self.page)
+            self.collector.screenshot("start", self.page)
             
         print("[RECORDING] Started network recording")
         
-    async def stop_recording(self) -> None:
+    def stop_recording(self) -> None:
         """Disable recording mode."""
         if not self.is_recording:
             print("[WARN] Not recording!")
@@ -509,22 +516,22 @@ class NetworkRecorder:
         # Stop tracing and save
         if self.trace_path:
             try:
-                await self.context.tracing.stop(path=str(self.trace_path))
+                self.context.tracing.stop(path=str(self.trace_path))
                 print(f"[TRACE] Saved: {self.trace_path}")
             except Exception as e:
                 print(f"[WARN] Could not save trace: {e}")
-            
+        
         # Screenshot on stop
         if self.page and self.collector:
-            await self.collector.screenshot("stop", self.page)
-            await self.collector.save_dom(self.page)
+            self.collector.screenshot("stop", self.page)
+            self.collector.save_dom(self.page)
             
         print("[RECORDING] Stopped network recording")
         
-    async def save_storage(self) -> None:
+    def save_storage(self) -> None:
         """Save storage state."""
         if self.context and self.collector:
-            await self.collector.save_storage_state(self.context)
+            self.collector.save_storage_state(self.context)
             
     def mark(self, message: str) -> None:
         """Add a marker."""
@@ -535,16 +542,15 @@ class NetworkRecorder:
     # Cleanup
     # ------------------------------------------------------------------------
     
-    async def cleanup(self) -> None:
+    def cleanup(self) -> None:
         """Cleanup resources."""
         print("[CLEANUP] Saving final state...")
         
         # Final storage save
-        await self.save_storage()
+        self.save_storage()
         
         # Update metadata with final markers
         if self.collector:
-            # Re-save metadata with markers
             meta_path = self.collector.get_run_dir() / "run_meta.json"
             if meta_path.exists():
                 meta = json.loads(meta_path.read_text(encoding="utf-8"))
@@ -557,7 +563,7 @@ class NetworkRecorder:
             
         # Close Playwright
         if self.playwright:
-            await self.playwright.stop()
+            self.playwright.stop()
             
         print("[CLEANUP] Done")
 
@@ -572,7 +578,7 @@ class CLI:
     def __init__(self, recorder: NetworkRecorder):
         self.recorder = recorder
         
-    async def run(self) -> None:
+    def run(self) -> None:
         """Run the CLI loop."""
         print("\n" + "=" * 60)
         print("  Playwright Network Recorder - Manual Control")
@@ -587,8 +593,7 @@ class CLI:
         
         while True:
             try:
-                # Get input (non-blocking would require separate thread)
-                # For simplicity, we use blocking input
+                # Get input
                 cmd = input("> ").strip()
                 
                 if not cmd:
@@ -601,13 +606,13 @@ class CLI:
                 
                 # Handle command
                 if command == "start":
-                    await self.recorder.start_recording()
+                    self.recorder.start_recording()
                     
                 elif command == "stop":
-                    await self.recorder.stop_recording()
+                    self.recorder.stop_recording()
                     
                 elif command == "save":
-                    await self.recorder.save_storage()
+                    self.recorder.save_storage()
                     
                 elif command == "mark":
                     if args:
@@ -616,7 +621,7 @@ class CLI:
                         print("[ERROR] Usage: mark <message>")
                         
                 elif command in ("quit", "exit", "q"):
-                    await self.recorder.cleanup()
+                    self.recorder.cleanup()
                     print("\n[EXIT] Artifacts saved. Goodbye!")
                     break
                     
@@ -626,38 +631,38 @@ class CLI:
                     
             except KeyboardInterrupt:
                 print("\n[INTERRUPT] Use 'quit' to exit properly")
-                await self.recorder.cleanup()
+                self.recorder.cleanup()
                 break
                 
             except EOFError:
                 break
                 
         # Ensure cleanup
-        await self.recorder.cleanup()
+        self.recorder.cleanup()
 
 
 # ============================================================================
 # Main Entry Point
 # ============================================================================
 
-async def main() -> None:
+def main() -> None:
     """Main entry point."""
     # Create recorder
     recorder = NetworkRecorder(artifacts_dir="artifacts")
     
     try:
         # Start browser
-        await recorder.start()
+        recorder.start()
         
         # Run CLI
         cli = CLI(recorder)
-        await cli.run()
+        cli.run()
         
     except Exception as e:
         print(f"[FATAL] {e}", file=sys.stderr)
-        await recorder.cleanup()
+        recorder.cleanup()
         raise
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()
